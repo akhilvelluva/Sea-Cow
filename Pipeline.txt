@@ -1,0 +1,94 @@
+The pipeline include following Steps
+
+1.Mapping of sea cow individual reads to Dugong genome
+2.Bam Filter and statistics 
+3.Genotyping of Sea cow reads 
+4.PSMC
+5.Genome Annotation
+6.Orthologous Assessment
+7.Codon based Alignment
+8.Codeml run
+
+#Mapping of sea cow individual reads to Dugong genome
+Here we used the  fastq2bam for reading and  merging the fastq reads into BAM format. 
+-m option will attempt to merge or trim reads. 
+Bwa bam2bam will take the indexed reference genome file and map with the parameter set of -n (num-diff) -o (max-gap-open) -l (seed-length) -p (listen-port) -t (num-threads).
+
+fastq2bam -m -1 Read_R1.fastq  -2 Read_R2.fastq |  bwa bam2bam -g Reference.fasta -n 0.01 -o 2 -l 16000 -p 4711 -t 48 -f Aligned.bam -
+
+#Bam Filter and statistics
+For removing duplicated and filtering based on the DNA fragment lengths and mapping quality we have used an in house perl program called analyzeBAM.pl with -minlength as 32 and -qual as 30.
+
+#Genotyping of Sea cow reads
+The genotyping of Sea cow individuals is done with snpAD tool and uses only the scaffold length  ≥ 100. The script name snpAD.sh used for genotyping with an input of scaffold names.
+
+#PSMC
+PSMC analysis requires a consensus genome sequence(fastq) that can be filtered to account for coverage and sequencing error. Only autosomal scaffolds longer than 100 kb can be used for the analysis.
+
+1. Fastq sequence for autosomal regions
+   Samtools mpileup -C50 -uf Reference.fasta Input.bam|bcftools call -c -|vcfutils.pl vcf2fq -d 10 -D 100 | gzip > diploid.fq.gz
+2. Fastq to PSMC
+   fq2psmcfa -q20  diploid.fq.gz > Input.psmcfa
+3. Run PSMC
+   psmc  -t40 -p "4+25*2+4+6" -o Input.psmc  Input.psmcfa
+4. Combine out (If you have more than one Individuals) 
+   cat Input.psmc Input02.psmc >combined.psmc 
+5. Plot
+   psmc_plot.pl -u “Mutation Rate” -g “Generation Time”  combined combined.psmc
+6. Perform bootstrapping (100 rounds)
+   splitfa Input.psmcfa >split-Input.psmcfa
+   seq 100 |xargs -i echo psmc -t40 -b -p "4+25*2+4+6" -o Input{}.psmc split-Input.psmcfa | sh
+
+#Genome Annotation
+
+For performing  the annotation EST or Protein Homology evidence is needed. For this we used Elephant, Human and Mouse assembled mRNA and protein sequence. 
+
+1. First Round
+The maker runs with the control files (ctl) such as maker_bopts, maker_exe and maker_opts.
+In maker_opts.ctl you need add the location/Informations on the following fields
+Genome,organism_type,est and protein.Also set the following flags to enable gene prediction solely on RNA and protein evidence:
+est2genome=1 #infer gene predictions directly from ESTs, 1 = yes, 0 = no 
+protein2genome=1 #infer predictions from protein homology, 1 = yes, 0 = no 
+After execution of  MAKER results are stored in a directory with the name of your assembly file plus .maker.output
+Two accessory scripts that come with MAKER : gff3_merge and fasta_merge used for merge GFF3 and FASTA files containing all genes.
+fasta_merge -d xxx_datastore_index.log
+gff3_merge -d xxx_datastore_index.log
+
+1.a: Train the gene gene predictor(SNAP)
+The maker2zff will create two files such as genome.ann and genome.dna which contain information about the gene sequences as well as the actual DNA sequences. 
+maker2zff  xxx_all.gff
+Then run fathom as follows 
+fathom genome.ann genome.dna -categorize 1000 
+fathom uni.ann uni.dna -export 1000 
+forge export.ann export.dna
+Finally train SNAP with hmm-assemble
+hmm-assembler .pl mygenome . >mygenome.hmm
+2. Run Second Round
+Add snaphmm= mygenome.hmm,remove the file paths to the genome,protein and est evidence or set the flags for est2genome=0 and protein2genome=0 and add xxx_all.gff (First round gff) to maker_gff, set all option under Re-annotation Using MAKER Derived GFF3 as one.
+
+#Orthologous Assessment
+
+The orthologous assessments begin with the blast out (table format out). For extracting the best hit from the blast out use Blast_Best_Hit.py script. 
+Syntax python Blast_Best_Hit.py >Best_blast_hit.txt
+The next step will be to find out for each query how many hits has got, In our study we have used Human,Mouse and Elephant proteins and need only three hits from blast out. 
+sort Best_blast_hit.txt |awk '{print$1}'|sort | uniq -c | sed 's/^ *//'|grep "^3" |awk '{print $2}' > 3hits.txt
+From the above list, need to find the IDs of each species by comparing to the Best_blast_hit.txt
+grep -wFf 3hits.txt Best_blast_hit.txt |awk '{print$1,$2}' >Ortho_Ids.txt
+For the next step we need to validate these orthologous with ensemble databases and you can download the orthologous Ids from the ensembl biomart :https://www.ensembl.org/biomart. 
+Use the script Match_Gene_From_Ensembel.awk for this purpose. This script will use the Ortho_Ids.txt and ortho_ensemble_downloaded (From Ensembl).
+Syntax awk Match_Gene_From_Ensembel.awk >Ensemble_Orthos.txt
+Next need to filter above output with number of orthologs with count 3 (3 species)
+sort Ensemble_Orthos.txt|awk '{print$1}'|uniq -c|sed 's/^ *//'|grep "^3" >Ens_Orthos_3_species.txt
+And will grep the Ids 
+grep -wFf Ens_Orthos_3_species.txt Ensemble_Orthos.txt > Orthologous.txt
+These above all steps will run for both sets of Dugong and manatee and finally both orthologous will merge with Merge_orthologus.awk script
+
+#Codon based Alignment
+
+For aligning the multiple species orthologous we have used macse codon based aligner with following options 
+java -jar macse_v2.03.jar -prog alignSequences -seq Input.fasta
+This tool will generate alignment at the NT and AA levels
+For removing the internal stop codons we have used exportAlignment function of  macse
+java -jar macse_v2.04.jar -prog exportAlignment -align Input.fas -codonForInternalStop NNN
+
+#Codeml run
