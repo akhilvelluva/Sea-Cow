@@ -1,0 +1,172 @@
+The pipeline include following Steps
+
+1.Mapping of sea cow individual reads to Dugong genome
+2.Bam Filter and statistics 
+3.Genotyping of Sea cow reads 
+4.PSMC
+5.Genome Annotation
+6.Orthologous Assessment
+7.Codon based Alignment
+8.Codeml run
+9.Gene Ontology annotation
+10.Population diversity estimates
+
+#Mapping of sea cow individual reads to Dugong genome
+Here we used the  fastq2bam for reading and  merging the fastq reads into BAM format. 
+-m option will attempt to merge or trim reads. 
+Bwa bam2bam will take the indexed reference genome file and map with the parameter set of -n (num-diff) -o (max-gap-open) -l (seed-length) -p (listen-port) -t (num-threads).
+
+fastq2bam -m -1 Read_R1.fastq  -2 Read_R2.fastq |  bwa bam2bam -g Reference.fasta -n 0.01 -o 2 -l 16000 -p 4711 -t 48 -f Aligned.bam -
+
+#Bam Filter and statistics
+For removing duplicated and filtering based on the DNA fragment lengths and mapping quality we have used an in house perl program called analyzeBAM.pl with -minlength as 32 and -qual as 30.
+
+#Genotyping of Sea cow reads
+The genotyping of Sea cow individuals is done with snpAD tool and uses only the scaffold length  ≥ 100. The script name snpAD.sh used for genotyping with an input of scaffold names.
+
+#PSMC
+PSMC analysis requires a consensus genome sequence(fastq) that can be filtered to account for coverage and sequencing error. Only autosomal scaffolds longer than 100 kb can be used for the analysis.
+
+1. Fastq sequence for autosomal regions
+   Samtools mpileup -C50 -uf Reference.fasta Input.bam|bcftools call -c -|vcfutils.pl vcf2fq -d 10 -D 100 | gzip > diploid.fq.gz
+2. Fastq to PSMC
+   fq2psmcfa -q20  diploid.fq.gz > Input.psmcfa
+3. Run PSMC
+   psmc  -t40 -p "4+25*2+4+6" -o Input.psmc  Input.psmcfa
+4. Combine out (If you have more than one Individuals) 
+   cat Input.psmc Input02.psmc >combined.psmc 
+5. Plot
+   psmc_plot.pl -u “Mutation Rate” -g “Generation Time”  combined combined.psmc
+6. Perform bootstrapping (100 rounds)
+   splitfa Input.psmcfa >split-Input.psmcfa
+   seq 100 |xargs -i echo psmc -t40 -b -p "4+25*2+4+6" -o Input{}.psmc split-Input.psmcfa | sh
+
+#Genome Annotation
+
+For performing  the annotation EST or Protein Homology evidence is needed. For this we used Elephant, Human and Mouse assembled mRNA and protein sequence. 
+
+1. First Round
+The maker runs with the control files (ctl) such as maker_bopts, maker_exe and maker_opts.
+In maker_opts.ctl you need add the location/Informations on the following fields
+Genome,organism_type,est and protein.Also set the following flags to enable gene prediction solely on RNA and protein evidence:
+est2genome=1 #infer gene predictions directly from ESTs, 1 = yes, 0 = no 
+protein2genome=1 #infer predictions from protein homology, 1 = yes, 0 = no 
+After execution of  MAKER results are stored in a directory with the name of your assembly file plus .maker.output
+Two accessory scripts that come with MAKER : gff3_merge and fasta_merge used for merge GFF3 and FASTA files containing all genes.
+fasta_merge -d xxx_datastore_index.log
+gff3_merge -d xxx_datastore_index.log
+
+1.a: Train the gene gene predictor(SNAP)
+The maker2zff will create two files such as genome.ann and genome.dna which contain information about the gene sequences as well as the actual DNA sequences. 
+maker2zff  xxx_all.gff
+Then run fathom as follows 
+fathom genome.ann genome.dna -categorize 1000 
+fathom uni.ann uni.dna -export 1000 
+forge export.ann export.dna
+Finally train SNAP with hmm-assemble
+hmm-assembler .pl mygenome . >mygenome.hmm
+2. Run Second Round
+Add snaphmm= mygenome.hmm,remove the file paths to the genome,protein and est evidence or set the flags for est2genome=0 and protein2genome=0 and add xxx_all.gff (First round gff) to maker_gff, set all option under Re-annotation Using MAKER Derived GFF3 as one.
+
+#Orthologous Assessment
+
+The orthologous assessments begin with the blast out (table format out). For extracting the best hit from the blast out use Blast_Best_Hit.py script. 
+Syntax python Blast_Best_Hit.py >Best_blast_hit.txt
+The next step will be to find out for each query how many hits has got, In our study we have used Human,Mouse and Elephant proteins and need only three hits from blast out. 
+sort Best_blast_hit.txt |awk '{print$1}'|sort | uniq -c | sed 's/^ *//'|grep "^3" |awk '{print $2}' > 3hits.txt
+From the above list, need to find the IDs of each species by comparing to the Best_blast_hit.txt
+grep -wFf 3hits.txt Best_blast_hit.txt |awk '{print$1,$2}' >Ortho_Ids.txt
+For the next step we need to validate these orthologous with ensemble databases and you can download the orthologous Ids from the ensembl biomart :https://www.ensembl.org/biomart. 
+Use the script Match_Gene_From_Ensembel.awk for this purpose. This script will use the Ortho_Ids.txt and ortho_ensemble_downloaded (From Ensembl).
+Syntax awk Match_Gene_From_Ensembel.awk >Ensemble_Orthos.txt
+Next need to filter above output with number of orthologs with count 3 (3 species)
+sort Ensemble_Orthos.txt|awk '{print$1}'|uniq -c|sed 's/^ *//'|grep "^3" >Ens_Orthos_3_species.txt
+And will grep the Ids 
+grep -wFf Ens_Orthos_3_species.txt Ensemble_Orthos.txt > Orthologous.txt
+These above all steps will run for both sets of Dugong and manatee and finally both orthologous will merge with Merge_orthologus.awk script
+
+#Codon based Alignment
+
+For aligning the multiple species orthologous we have used macse codon based aligner with following options 
+java -jar macse_v2.03.jar -prog alignSequences -seq Input.fasta
+This tool will generate alignment at the NT and AA levels
+For removing the internal stop codons we have used exportAlignment function of  macse
+java -jar macse_v2.04.jar -prog exportAlignment -align Input.fas -codonForInternalStop NNN
+
+#Codeml run
+For running codeml we have removed all internal stop codons from the alignment. The assessment of each gene was done with the perl script called kaks_codeml_lineage.pl 
+You need to provide the tree files (phylip format) and the codeml control files to the CodeMLPairwise.pm and kaks_codeml_lineage.pl scripts . 
+Syntax : 
+for i in `ls input_folder`; do perl kaks_codeml_lineage.pl $i ./output/`echo $i | sed 's/.fasta/codeml_0.txt/g'` 2> ./output/`echo $i | sed 's/.fasta/codeml_0.txt.e/g'`; done
+The output folder will have model and error files 
+You need to run the script for model0 and model 2(Seacow as forward branch) and compare the models with likelihood ratio test 
+awk 'BEGIN {while ( getline < ARGV[1] > 0 ){extradata[$1]=$0} ARGV[1]="";} {OFS="\t"; print extradata[$1], $0}' results_model0.txt  results_model2.txt | awk 'BEGIN {OFS="\t"; print "Gene_ID", "seq_length", "lnL_model0", "omega_model0", "lnL_model2", "omega_background", "omega_COL", "LRT", "Trend"} {gsub("lnL:",""); gsub(".fasta",""); if ($34 > $33) {print $1, $2, $4, $16, $20, $33, $34, 2*($20-$4), "faster"} else {print $1, $2, $4, $16, $20, $33, $34, 2*($20-$4), "slower"}}' | awk '$(NF-1) >3.84' > genes_sign_different.txt
+
+#Gene Ontology (GO) annotation
+For gene ontology analysis we used FUNC, for this ensembl gene ids of the genes to test are needed. Using the script mapping_common.py 4877 genes with orthos are mapped to the GO names (Gene Ontology (GO) annotation from Ensembl v98)
+
+The input data sets are divided into two 
+1. Stop genes 
+for i in `awk '{print $1}' stops_gene_ID.txt`; do grep -w $i go_mapped.txt | awk 'BEGIN {OFS=FS="\t"}; {print $2,$7,"1"}'| awk  'NF==3'; done > forward_genes.txt
+
+2. Background genes
+for i in `awk '{print $1}' stops_gene_ID.txt`; do grep -w -v $i go_mapped.txt | awk 'BEGIN {OFS=FS="\t"}; {print $2,$7,"0"}'| awk  'NF==3'; done > background_genes.txt
+
+Prepare Input for FUNC
+
+cat forward_genes.txt background_genes.txt > input_stop_codon_func.txt
+
+Run Func
+
+func_hyper -i input_stop_codon_func.txt -t go_monthly-termdb-tables -o output-directory 
+
+Find significant groups
+
+To find the significant groups use the script get.sig.go_Func.sh. It will take the groups.txt in the out put folder of FUNC and generate significant_groups.txt
+
+Next will Collect GO cats to identify the genes
+
+input_to_go_genes.pl go_monthly-termdb-tables/term.txt go_monthly-termdb-tables/graph_path.txt input_stop_codon_func.txt > GO_cats_for_input_stop_codon_func.txt
+
+Get the genes for the significant GO terms 
+for i in `cat significant_groups.txt | cut -f 3 | grep GO`; do echo $i; grep $i GO_cats_for_input_stop_codon_func.txt | cut -f 1 > GO.txt; for j in `cat GO.txt`; do grep $j input_stop_codon_func.txt  |awk '$3==1' | cut -f 1 | sort | uniq | tr "\n" ", ";  grep $j stops_gene_ID.txt | cut -f 2 | tr "\n" "; "; done; rm GO.txt; done | sed 's/;GO:/\nGO:/g' > GO_genes.txt
+Arrange it on two columns
+xargs -n2 < GO_genes.txt 
+
+#Population diversity estimates
+
+We used Consensify to generate a consensus pseudohaploid genome sequence.
+
+Consensify takes 3 files as input counts,pos and lengths.The .counts and .pos files can be generated from a standard bam file using the -doCounts function in angsd
+
+ngsd -doCounts 1 -dumpCounts 3 -rf scaffold_lengths.txt -i Input.bam -out out_name
+
+Unzip the count/pos files
+
+gunzip -k out_name.counts.gz
+gunzip -k out_name.pos.gz
+
+Make Scaffold lenght file containing a 2 column table: scaffold name, length (Tab)
+Run Consensify
+Here maximum read depth filter can set as 30 (i.e. only consider positions covered by 30 reads or fewer), You can change that depends upon the alignment score
+
+perl Consensify-master/Consensify_v0.1.pl out_name.pos out_name.counts scaffold_lengths.txt out_coverage30.fasta 30 
+
+Consensify output were splitted into each scaffolds by using following commands 
+
+faSplit byname scaffolds.fa outfolder/
+
+Pairwise comparisons of individuals dated to the same time period
+For pairwise comparison two individuals scaffolds were concatenated as like this
+ 
+cat individual01/scaffold100.fa individual02/scaffold100.fa > For_Consensify/scaffold100.fa
+
+Then count the number of differences within non overlapping blocks of 50 kb by using Pairwise_comparison.py script as follows 
+
+FILES=For_Consensify/*
+for f in $FILES
+do
+python Pairwise_comparison.py $f > "$f"_.count
+done
+
+
